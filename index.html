@@ -364,7 +364,7 @@ renderChips(); render();
 
 /* ==================================================================
    答题挑战
-   所有人的轮次、错题和选项反馈存在本浏览器 localStorage，刷新不丢。
+   答题记录和反馈存在网上同一份名单里，换电脑也能看到。
    ================================================================== */
 const PPX = 'quizplay_' + DATA.exportedAt + '|';
 const ALLK = 'quizplay_v2_' + DATA.exportedAt;
@@ -398,16 +398,110 @@ function absorbPlay(o){
 function loadPlay(){
   play = {hist: [], wrong: {}, fb: {}};
   st.keys().filter(k => k.startsWith('quizplay_') && k !== ALLK).forEach(k => st.del(k));
-  absorbPlay(parseMarks(st.get(ALLK)));
-  const seen = new Set();
-  play.hist = play.hist.filter(h => {
-    const k = [h.by || '', h.t || '', h.at || '', h.rate, h.correct, h.total, h.sec].join('|');
-    if (seen.has(k)) return false;
-    seen.add(k); return true;
-  }).sort((a, b) => (b.t || 0) - (a.t || 0) || String(b.at || '').localeCompare(String(a.at || '')));
-  savePlay();
+  const o = parseMarks(st.get(ALLK));
+  if (o.wrong && typeof o.wrong === 'object') play.wrong = o.wrong;
 }
 function savePlay(){ st.set(ALLK, JSON.stringify(play)); }
+
+const CLOUD = 'https://mantledb.sh/v2/laicai-quiz-records/log';
+let cloudMsg = '';
+let cloudJob = Promise.resolve();
+let cloudSeenAt = 0;
+let pulling = false;
+function histKey(h){ return [h.by || '', h.t || '', h.rate, h.correct, h.total].join('|'); }
+function fbKey(x){ return x.sid && x.sid !== 'legacy' ? String(x.sid) : ((x.sid || '') + '\n' + x.t); }
+function normalizeCloud(raw){
+  const hist = Array.isArray(raw && raw.hist) ? raw.hist : [];
+  const fb = {}, src = raw && raw.fb && typeof raw.fb === 'object' ? raw.fb : {};
+  Object.keys(src).forEach(id => {
+    const items = Array.isArray(src[id] && src[id].items) ? src[id].items : [];
+    const map = new Map();
+    items.forEach(x => {
+      if (!x || !String(x.t || '').trim()) return;
+      map.set(fbKey(x), {t: String(x.t), at: x.at || '', sid: x.sid || '', by: x.by || ''});
+    });
+    if (map.size) fb[id] = {items: [...map.values()]};
+  });
+  const seen = new Set(), rows = [];
+  hist.forEach(h => {
+    if (!h) return;
+    const k = histKey(h);
+    if (seen.has(k)) return;
+    seen.add(k);
+    rows.push({t: h.t || 0, at: h.at || '', by: h.by || '', total: h.total, correct: h.correct, rate: h.rate, sec: h.sec, cat: h.cat || ''});
+  });
+  rows.sort((a, b) => (b.t || 0) - (a.t || 0));
+  if (rows.length > 300) rows.length = 300;
+  return {hist: rows, fb: fb};
+}
+function applyCloud(raw){
+  const data = normalizeCloud(raw), wrong = play.wrong;
+  play.hist = data.hist;
+  play.fb = {};
+  Object.keys(data.fb).forEach(id => { play.fb[id] = {t: '', opts: {}, at: '', items: data.fb[id].items, _kept: true}; });
+  play.wrong = wrong;
+  savePlay();
+}
+function refreshViews(){
+  renderSide();
+  if (!quiz) renderQuiz();
+}
+function upsertHist(base, row){
+  if (!base.hist.some(h => histKey(h) === histKey(row))) base.hist.unshift(row);
+  base.hist.sort((a, b) => (b.t || 0) - (a.t || 0));
+  if (base.hist.length > 300) base.hist.length = 300;
+}
+function upsertFb(base, id, item){
+  if (!String(item && item.t || '').trim()){
+    if (base.fb[id]) base.fb[id].items = base.fb[id].items.filter(x => fbKey(x) !== fbKey(item));
+    return;
+  }
+  if (!base.fb[id]) base.fb[id] = {items: []};
+  const slim = {t: item.t, at: item.at || '', sid: item.sid || '', by: item.by || ''};
+  const i = base.fb[id].items.findIndex(x => fbKey(x) === fbKey(slim));
+  if (i >= 0) base.fb[id].items[i] = slim; else base.fb[id].items.push(slim);
+}
+function cloudCovers(now, base){
+  const histOk = base.hist.every(h => now.hist.some(x => histKey(x) === histKey(h)));
+  const fbOk = Object.keys(base.fb).every(id => {
+    const items = base.fb[id].items || [];
+    const got = (now.fb[id] && now.fb[id].items) || [];
+    return items.every(it => got.some(g => fbKey(g) === fbKey(it) && g.t === it.t));
+  });
+  return histOk && fbOk;
+}
+function enqueue(mutator){
+  cloudJob = cloudJob.then(async () => {
+    for (let n = 0; n < 6; n++){
+      const res = await fetch(CLOUD, {cache: 'no-store'});
+      if (!res.ok) throw new Error('get');
+      const base = normalizeCloud(await res.json());
+      mutator(base);
+      const put = await fetch(CLOUD, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(base)});
+      if (!put.ok) continue;
+      const check = await fetch(CLOUD, {cache: 'no-store'});
+      if (!check.ok) continue;
+      const now = normalizeCloud(await check.json());
+      if (cloudCovers(now, base)){ cloudMsg = ''; applyCloud(now); cloudSeenAt = Date.now(); refreshViews(); return; }
+    }
+    cloudMsg = '这次记录没同步上，请再试一次';
+    refreshViews();
+  }).catch(() => { cloudMsg = '这次记录没同步上，请再试一次'; refreshViews(); });
+  return cloudJob;
+}
+function pullCloud(){
+  if (pulling) return;
+  pulling = true;
+  fetch(CLOUD, {cache: 'no-store'}).then(r => { if (!r.ok) throw new Error('get'); return r.json(); }).then(data => {
+    cloudMsg = '';
+    applyCloud(data);
+    cloudSeenAt = Date.now();
+    refreshViews();
+  }).catch(() => {
+    cloudMsg = '别人的记录暂时没加载出来，请刷新';
+    refreshViews();
+  }).finally(() => { pulling = false; });
+}
 
 function playStats(){
   const rounds = play.hist.length;
@@ -500,12 +594,23 @@ function finishQuiz(){
   const sec = Math.round((Date.now() - quiz.startAt) / 1000);
   quiz.result = {total: total, correct: correct, rate: Math.round(correct / total * 100), sec: sec, wrongs: wrongs};
   quiz.finished = true;
-  play.hist.unshift({t: Date.now(), at: new Date().toLocaleString('zh-CN'), by: quiz.by || '', total: total, correct: correct, rate: quiz.result.rate, sec: sec, cat: quiz.cat, wrongIds: wrongs.map(w => w.id)});
+  const row = {t: Date.now(), at: new Date().toLocaleString('zh-CN'), by: quiz.by || '', total: total, correct: correct, rate: quiz.result.rate, sec: sec, cat: quiz.cat || ''};
+  play.hist.unshift(row);
   if (play.hist.length > 300) play.hist.length = 300;
   savePlay(); renderQuiz(); renderPlayScore();
+  const sid = String(quiz.startAt);
+  const fbSnap = [];
+  Object.keys(play.fb).forEach(id => {
+    ((play.fb[id] && play.fb[id].items) || []).forEach(it => { if (it && it.sid === sid) fbSnap.push({id: id, it: it}); });
+  });
+  enqueue(base => {
+    upsertHist(base, row);
+    fbSnap.forEach(x => upsertFb(base, x.id, x.it));
+  });
 }
 function renderQuiz(){
   renderSide();
+  if (!quiz && Date.now() - cloudSeenAt > 8000) pullCloud();
   const w = document.getElementById('quizWrap');
   if (!quiz){
     const s = playStats();
@@ -625,7 +730,7 @@ function renderSide(){
   el.hidden = false;
   const rows = play.hist.slice(0, 80).map(h => `<tr><td>${esc(h.by || '')}</td><td>${esc(h.at || '')}</td><td><b>${h.rate}%</b></td><td>${h.correct}/${h.total}</td><td>${h.sec == null ? '' : h.sec + 's'}</td></tr>`).join('');
   const table = rows ? `<table class="logtb"><tr><th style="text-align:left">玩家</th><th style="text-align:left">时间</th><th>正确率</th><th>答对</th><th>用时</th></tr>${rows}</table>` : '';
-  el.innerHTML = `<h3>所有人的答题记录</h3>${table}
+  el.innerHTML = `<h3>所有人的答题记录</h3>${cloudMsg ? `<p class="meta">${esc(cloudMsg)}</p>` : ''}${table}
     <div class="side-note">反馈</div>${fb || '<div class="fb-line" style="color:var(--muted)">还没有反馈。</div>'}`;
 }
 
@@ -647,6 +752,9 @@ function saveFb(id, val){
   else f.items.push({ t: text, at: new Date().toLocaleString('zh-CN'), sid: sid, by: by });
   f.t = text; f.at = new Date().toLocaleString('zh-CN');
   savePlay(); renderSide();
+  const item = text.trim() ? (f.items.find(x => x.sid === sid) || {t: text, sid: sid, by: by}) : {t: '', sid: sid, by: by};
+  clearTimeout(saveFb._t);
+  saveFb._t = setTimeout(() => { enqueue(base => upsertFb(base, id, item)); }, 500);
 }
 function saveOptFb(id, i, val){
   const f = play.fb[id] || (play.fb[id] = {t: '', opts: {}, at: ''});
