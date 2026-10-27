@@ -126,8 +126,7 @@ main.shell{max-width:1180px;display:flex;gap:16px;align-items:flex-start}
   <h1 id="ttl">答题挑战</h1>
   <div class="meta" id="sub"></div>
   <div class="bar" id="quizBar">
-    <span class="meta">分类：</span><select id="qcat" class="tsel"></select>
-    <button class="tbtn pri" onclick="startQuiz()">开始挑战</button>
+    <span class="meta">题目分类：</span><select id="qcat" class="tsel"></select>
   </div>
   <div id="reviewOnly" hidden>
     <div class="bar" id="grpChips"></div>
@@ -368,7 +367,7 @@ renderChips(); render();
    所有人的轮次、错题和选项反馈存在本浏览器 localStorage，刷新不丢。
    ================================================================== */
 const PPX = 'quizplay_' + DATA.exportedAt + '|';
-const ALLK = 'quizplay_all_' + DATA.exportedAt;
+const ALLK = 'quizplay_v2_' + DATA.exportedAt;
 let play = {hist: [], wrong: {}, fb: {}};
 let quiz = null;                 // {list, idx, picks, startAt, cat, finished, result}
 let mode = 'quiz';
@@ -398,11 +397,11 @@ function absorbPlay(o){
 }
 function loadPlay(){
   play = {hist: [], wrong: {}, fb: {}};
+  st.keys().filter(k => k.startsWith('quizplay_') && k !== ALLK).forEach(k => st.del(k));
   absorbPlay(parseMarks(st.get(ALLK)));
-  st.keys().filter(k => k.startsWith(PPX)).forEach(k => absorbPlay(parseMarks(st.get(k))));
   const seen = new Set();
   play.hist = play.hist.filter(h => {
-    const k = [h.t || '', h.at || '', h.rate, h.correct, h.total, h.sec].join('|');
+    const k = [h.by || '', h.t || '', h.at || '', h.rate, h.correct, h.total, h.sec].join('|');
     if (seen.has(k)) return false;
     seen.add(k); return true;
   }).sort((a, b) => (b.t || 0) - (a.t || 0) || String(b.at || '').localeCompare(String(a.at || '')));
@@ -446,11 +445,13 @@ function pickList(n, cat, wrongFirst){
   return out;
 }
 function startQuiz(){
+  const name = (prompt('你的名字') || '').trim().replace(/\s+/g, ' ');
+  if (!name) return;
   const n = 10;
   const cat = (document.getElementById('qcat') || {}).value || '全部';
   const list = pickList(n, cat, false);
   if (!list.length){ alert('这个分类下没有可抽的题目'); return; }
-  quiz = {list: list, idx: 0, picks: new Array(list.length).fill(null), startAt: Date.now(), cat: cat, finished: false, result: null};
+  quiz = {list: list, idx: 0, picks: new Array(list.length).fill(null), startAt: Date.now(), cat: cat, finished: false, result: null, by: name};
   setMode('quiz');
 }
 function startWrongQuiz(){
@@ -499,7 +500,7 @@ function finishQuiz(){
   const sec = Math.round((Date.now() - quiz.startAt) / 1000);
   quiz.result = {total: total, correct: correct, rate: Math.round(correct / total * 100), sec: sec, wrongs: wrongs};
   quiz.finished = true;
-  play.hist.unshift({t: Date.now(), at: new Date().toLocaleString('zh-CN'), total: total, correct: correct, rate: quiz.result.rate, sec: sec, cat: quiz.cat, wrongIds: wrongs.map(w => w.id)});
+  play.hist.unshift({t: Date.now(), at: new Date().toLocaleString('zh-CN'), by: quiz.by || '', total: total, correct: correct, rate: quiz.result.rate, sec: sec, cat: quiz.cat, wrongIds: wrongs.map(w => w.id)});
   if (play.hist.length > 300) play.hist.length = 300;
   savePlay(); renderQuiz(); renderPlayScore();
 }
@@ -611,18 +612,19 @@ function feedbackBlock(){
     const items = collectItems(f);
     if (!items.length) return '';
     const cat = q && q.cat ? `<span class="qcat">${esc(q.cat)}</span>` : '';
-    const lis = items.map(x => `<li>${esc(x.t)}</li>`).join('');
+    const lis = items.map(x => `<li>${x.by ? esc(x.by) + '：' : ''}${esc(x.t)}</li>`).join('');
     return `<div class="fb-line"><span class="qid">${esc(q ? q.id : id)}</span>${cat}<b>${q ? esc(q.q) : ''}</b><ul class="fb-multi">${lis}</ul></div>`;
   }).join('');
 }
 function renderSide(){
   const el = document.getElementById('side');
   if (!el) return;
+  if (quiz && !quiz.finished){ el.hidden = true; el.innerHTML = ''; return; }
   const fb = feedbackBlock();
   if (!play.hist.length && !fb){ el.hidden = true; el.innerHTML = ''; return; }
   el.hidden = false;
-  const rows = play.hist.slice(0, 80).map(h => `<tr><td>${esc(h.at || '')}</td><td><b>${h.rate}%</b></td><td>${h.correct}/${h.total}</td><td>${h.sec == null ? '' : h.sec + 's'}</td></tr>`).join('');
-  const table = rows ? `<table class="logtb"><tr><th style="text-align:left">时间</th><th>正确率</th><th>答对</th><th>用时</th></tr>${rows}</table>` : '';
+  const rows = play.hist.slice(0, 80).map(h => `<tr><td>${esc(h.by || '')}</td><td>${esc(h.at || '')}</td><td><b>${h.rate}%</b></td><td>${h.correct}/${h.total}</td><td>${h.sec == null ? '' : h.sec + 's'}</td></tr>`).join('');
+  const table = rows ? `<table class="logtb"><tr><th style="text-align:left">玩家</th><th style="text-align:left">时间</th><th>正确率</th><th>答对</th><th>用时</th></tr>${rows}</table>` : '';
   el.innerHTML = `<h3>所有人的答题记录</h3>${table}
     <div class="side-note">反馈</div>${fb || '<div class="fb-line" style="color:var(--muted)">还没有反馈。</div>'}`;
 }
@@ -637,11 +639,12 @@ function saveFb(id, val){
     f._kept = true;
   }
   const sid = roundKey();
+  const by = quiz && quiz.by || '';
   const text = String(val);
   const i = f.items.findIndex(x => x.sid === sid);
   if (!text.trim()){ if (i >= 0) f.items.splice(i, 1); }
-  else if (i >= 0){ f.items[i].t = text; f.items[i].at = new Date().toLocaleString('zh-CN'); }
-  else f.items.push({ t: text, at: new Date().toLocaleString('zh-CN'), sid: sid });
+  else if (i >= 0){ f.items[i].t = text; f.items[i].at = new Date().toLocaleString('zh-CN'); f.items[i].by = by; }
+  else f.items.push({ t: text, at: new Date().toLocaleString('zh-CN'), sid: sid, by: by });
   f.t = text; f.at = new Date().toLocaleString('zh-CN');
   savePlay(); renderSide();
 }
